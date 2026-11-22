@@ -148,7 +148,10 @@ def analisar(hist, casa, fora, hoje, normalizar=True):
     M, beta = matriz(lam_c, lam_f, freq, normalizar)
     btts, raros = metricas(M)
     return {"lam_c": lam_c, "lam_f": lam_f, "beta": beta, "freq": freq,
-            "btts": btts, "raros": raros, "soma": M.sum()}
+            "btts": btts, "raros": raros, "soma": M.sum(),
+            "liga": (hist.FTHG.mean(), hist.FTAG.mean(), len(hist), hist.Date.min(), hist.Date.max()),
+            "equipas": (h10.FTHG.mean(), h10.FTAG.mean(), a10.FTAG.mean(), a10.FTHG.mean()),
+            "h10": h10, "a10": a10}
 
 
 def cumpre(r):
@@ -163,14 +166,16 @@ def odd(p):
 def enviar_telegram(texto):
     token, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
-        print("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID não definidos; mensagem não enviada.")
-        return
+        raise SystemExit("ERRO: TELEGRAM_TOKEN / TELEGRAM_CHAT_ID não definidos (verifica os segredos no GitHub).")
     bloco = ""
     for linha in texto.split("\n") + [None]:
         if linha is None or len(bloco) + len(linha) > 3800:
             if bloco:
-                requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                              json={"chat_id": chat, "text": bloco}, timeout=30)
+                r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                                  json={"chat_id": chat, "text": bloco}, timeout=30)
+                if not r.ok:
+                    raise SystemExit(f"ERRO do Telegram ({r.status_code}): {r.text}")
+                print("Mensagem enviada para o Telegram.")
             bloco = ""
         if linha is not None:
             bloco += linha + "\n"
@@ -186,6 +191,14 @@ def simular(liga, casa, fora, hoje):
         if r is None:
             print("Poucos jogos de uma das equipas.")
             return
+        if not norm:
+            lc, lf, n, d0, d1 = r["liga"]
+            cm, cs, fm, fs = r["equipas"]
+            print(f"\nLiga: {n} jogos ({d0:%d/%m/%Y} a {d1:%d/%m/%Y}) | média golos casa {lc:.2f}, fora {lf:.2f}")
+            print(f"{casa} em casa (últimos {len(r['h10'])}): marcados {cm:.2f}, sofridos {cs:.2f}")
+            print(r["h10"].assign(Date=r["h10"].Date.dt.strftime("%d/%m/%Y")).to_string(index=False, header=False))
+            print(f"{fora} fora (últimos {len(r['a10'])}): marcados {fm:.2f}, sofridos {fs:.2f}")
+            print(r["a10"].assign(Date=r["a10"].Date.dt.strftime("%d/%m/%Y")).to_string(index=False, header=False))
         print(f"\n--- {'NORMALIZADO (β automático)' if norm else 'SEM normalizar (β=1, como na folha)'} ---")
         print(f"Golos esperados: {r['lam_c']:.2f} - {r['lam_f']:.2f} | β={r['beta']:.3f} | soma da matriz={r['soma']:.2%}")
         print("Frequências 0-0/1-0/0-1/1-1:", {f"{k[0]}-{k[1]}": f"{v:.2%}" for k, v in r["freq"].items()})
@@ -205,8 +218,7 @@ def main():
 
     fx = ler_csv(URL_FIXTURES)
     if fx is None:
-        print("Não consegui descarregar o fixtures.csv")
-        return
+        raise SystemExit("ERRO: não consegui descarregar o fixtures.csv")
     fx["Date"] = pd.to_datetime(fx["Date"], dayfirst=True, errors="coerce")
     fx = fx[(fx.Date >= hoje) & (fx.Date <= hoje + pd.Timedelta(days=DIAS_A_FRENTE))]
     fx = fx[fx.Div.isin(LIGAS)]
