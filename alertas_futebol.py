@@ -15,6 +15,7 @@ Uso:
   python alertas_futebol.py                          # corre os jogos de hoje e envia para o Telegram
   python alertas_futebol.py --sem-telegram           # só imprime
   python alertas_futebol.py --simular SP1 Barcelona Villarreal   # um jogo à escolha (para validar com a folha)
+  python alertas_futebol.py --simular MLS "Inter Miami" "Columbus Crew"   # MLS e BRA (Brasileirão); nomes com espaços entre aspas
 
 Variáveis de ambiente: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 """
@@ -40,6 +41,12 @@ LIGAS = {
     "T1": "Süper Lig", "G1": "Super League Grécia",
 }
 
+# Ligas "extra" do football-data.co.uk (ficheiro único com todas as épocas; época = ano civil)
+# (desligadas: dicionário vazio. Para ativar, usa as entradas "MLS" e "BRA" do exemplo abaixo)
+# {"MLS": {"nome": "MLS", "ficheiro": "USA", "pais": "USA", "liga": "MLS"},
+#  "BRA": {"nome": "Brasileirão Série A", "ficheiro": "BRA", "pais": "Brazil", "liga": "Serie A"}}
+LIGAS_EXTRA = {}
+
 JOGOS_AMOSTRA = 10      # últimos N jogos de cada equipa (casa / fora) para os golos esperados
 MIN_JOGOS = 5           # mínimo de jogos de cada equipa para analisar
 FATOR_CASA = 0.05       # vantagem de casa (5%)
@@ -59,6 +66,8 @@ DIAS_A_FRENTE = 0       # 0 = só jogos de hoje; 1 = hoje e amanhã
 ENVIAR_SE_VAZIO = True  # envia mensagem mesmo sem jogos que cumpram os critérios
 URL_FIXTURES = "https://www.football-data.co.uk/fixtures.csv"
 URL_LIGA = "https://www.football-data.co.uk/mmz4281/{epoca}/{liga}.csv"
+URL_FIXTURES_EXTRA = "https://www.football-data.co.uk/new_league_fixtures.csv"
+URL_LIGA_EXTRA = "https://www.football-data.co.uk/new/{ficheiro}.csv"
 # =====================================================================
 
 
@@ -75,6 +84,15 @@ def ler_csv(url):
     return pd.read_csv(io.StringIO(texto), on_bad_lines="skip")
 
 
+def _limpar(df):
+    df = df[["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]].dropna()
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    df = df.dropna(subset=["Date"]).sort_values("Date")
+    df["FTHG"] = df["FTHG"].astype(int)
+    df["FTAG"] = df["FTAG"].astype(int)
+    return df
+
+
 def carregar_historico(liga, hoje):
     partes = []
     for recuo in (0, 1):  # época atual + anterior
@@ -83,13 +101,30 @@ def carregar_historico(liga, hoje):
             partes.append(df)
     if not partes:
         return None
-    df = pd.concat(partes, ignore_index=True)
-    df = df[["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]].dropna()
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-    df = df.dropna(subset=["Date"]).sort_values("Date")
-    df["FTHG"] = df["FTHG"].astype(int)
-    df["FTAG"] = df["FTAG"].astype(int)
-    return df
+    return _limpar(pd.concat(partes, ignore_index=True))
+
+
+def carregar_historico_extra(cfg, hoje):
+    """MLS / Brasileirão: um único CSV com todas as épocas; usa o ano atual + o anterior."""
+    df = ler_csv(URL_LIGA_EXTRA.format(ficheiro=cfg["ficheiro"]))
+    if df is None:
+        return None
+    if "Country" in df.columns and "League" in df.columns:
+        df = df[(df["Country"] == cfg["pais"]) & (df["League"] == cfg["liga"])]
+    epoca = pd.to_numeric(df["Season"], errors="coerce")
+    df = df[epoca >= hoje.year - 1]
+    df = df.rename(columns={"Home": "HomeTeam", "Away": "AwayTeam", "HG": "FTHG", "AG": "FTAG"})
+    return _limpar(df)
+
+
+def carregar(liga, hoje):
+    if liga in LIGAS_EXTRA:
+        return carregar_historico_extra(LIGAS_EXTRA[liga], hoje)
+    return carregar_historico(liga, hoje)
+
+
+def nome_liga(liga):
+    return LIGAS_EXTRA[liga]["nome"] if liga in LIGAS_EXTRA else LIGAS[liga]
 
 
 def pmf(lam, n=MAX_GOLOS):
@@ -183,7 +218,7 @@ def enviar_telegram(texto):
 
 
 def simular(liga, casa, fora, hoje):
-    hist = carregar_historico(liga, hoje)
+    hist = carregar(liga, hoje)
     if hist is None:
         print("Não consegui descarregar os dados da liga.")
         return
@@ -224,12 +259,27 @@ def main():
     fx = fx[(fx.Date >= hoje) & (fx.Date <= hoje + pd.Timedelta(days=DIAS_A_FRENTE))]
     fx = fx[fx.Div.isin(LIGAS)]
 
+    jogos_por_liga = {liga: fx[fx.Div == liga] for liga in fx.Div.unique()}
+
+    # ligas extra (MLS, Brasileirão)
+    fxe = ler_csv(URL_FIXTURES_EXTRA) if LIGAS_EXTRA else None
+    if LIGAS_EXTRA and fxe is None:
+        print("AVISO: não consegui descarregar o new_league_fixtures.csv (MLS/Brasileirão ignoradas).")
+    elif fxe is not None:
+        fxe = fxe.rename(columns={"Home": "HomeTeam", "Away": "AwayTeam"})
+        fxe["Date"] = pd.to_datetime(fxe["Date"], dayfirst=True, errors="coerce")
+        fxe = fxe[(fxe.Date >= hoje) & (fxe.Date <= hoje + pd.Timedelta(days=DIAS_A_FRENTE))]
+        for cod, cfg in LIGAS_EXTRA.items():
+            sub = fxe[(fxe.Country == cfg["pais"]) & (fxe.League == cfg["liga"])]
+            if len(sub):
+                jogos_por_liga[cod] = sub
+
     alertas, analisados = [], 0
-    for liga in fx.Div.unique():
-        hist = carregar_historico(liga, hoje)
+    for liga, jogos in jogos_por_liga.items():
+        hist = carregar(liga, hoje)
         if hist is None:
             continue
-        for _, j in fx[fx.Div == liga].iterrows():
+        for _, j in jogos.iterrows():
             r = analisar(hist, j.HomeTeam, j.AwayTeam, hoje)
             if r is None:
                 continue
@@ -244,7 +294,7 @@ def main():
         linhas = [cab, f"Critérios: BTTS ≥ {LIM_BTTS:.0%} {'e' if EXIGIR_AMBOS else 'ou'} raros ≥ {LIM_RAROS:.0%}\n"]
         for liga, j, r in sorted(alertas, key=lambda x: -x[2]["raros"]):
             hora = j.get("Time", "")
-            linhas.append(f"{LIGAS[liga]} {hora}\n{j.HomeTeam} vs {j.AwayTeam}\n"
+            linhas.append(f"{nome_liga(liga)} {hora}\n{j.HomeTeam} vs {j.AwayTeam}\n"
                           f"BTTS {r['btts']:.1%} (odd {odd(r['btts']):.2f}) | "
                           f"Raros {r['raros']:.1%} (odd {odd(r['raros']):.2f})\n"
                           f"Golos esperados {r['lam_c']:.2f} - {r['lam_f']:.2f}\n")
