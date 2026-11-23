@@ -6,9 +6,10 @@ Replica o "Modelo de Poisson simplificado corrigido" da folha Google Sheets:
   1. Golos esperados = (marcados x sofridos do adversário) / média da liga
   2. Ajuste de vantagem de casa (+5%), mantendo o total de golos
   3. Matriz de Poisson 0..10 x 0..10
-  4. Células 0-0, 1-0, 0-1, 1-1 passam a ser a frequência histórica (= Poisson x alfa)
-  5. As restantes células são multiplicadas por beta, calculado automaticamente
-     para a matriz somar 100%
+  4. Células 0-0, 1-0, 0-1, 1-1 passam a ser a frequência histórica da liga
+     (época atual + anterior) = Poisson x alfa
+  5. As restantes células são multiplicadas por beta (β). Com NORMALIZAR = True, o β é
+     calculado para a matriz somar 100%; com False, β = 1 (como a folha)
 
 Uso:
   python alertas_futebol.py                          # corre os jogos de hoje e envia para o Telegram
@@ -40,7 +41,6 @@ LIGAS = {
 }
 
 JOGOS_AMOSTRA = 10      # últimos N jogos de cada equipa (casa / fora) para os golos esperados
-JOGOS_ALFA = 20         # jogos por equipa usados nas frequências históricas (alfa)  <-- PRESSUPOSTO, validar com a folha
 MIN_JOGOS = 5           # mínimo de jogos de cada equipa para analisar
 FATOR_CASA = 0.05       # vantagem de casa (5%)
 MAX_GOLOS = 10
@@ -48,6 +48,7 @@ MAX_GOLOS = 10
 LIM_BTTS = 0.65         # BTTS >= 65%
 LIM_RAROS = 0.12        # eventos raros ("2GV") >= 12%
 EXIGIR_AMBOS = True     # True = BTTS E raros; False = qualquer um dos dois
+NORMALIZAR = False      # False = números iguais aos da folha (β=1, matriz soma >100%); True = β automático (soma 100%)
 
 # Resultados raros (casa, fora). Os dois últimos (4-2 e 2-4) são necessários para
 # reproduzir o 18,49% do exemplo da folha; remove-os se não os quiseres.
@@ -104,12 +105,10 @@ def golos_esperados(media_liga_casa, media_liga_fora, casa_marc, casa_sof, fora_
     return lam_c, lam_f
 
 
-def freq_historica(h, a):
-    """Frequência de 0-0, 1-0, 0-1 e 1-1 nos jogos das duas equipas (casa da casa + fora do visitante)."""
-    jogos = pd.concat([h.tail(JOGOS_ALFA)[["FTHG", "FTAG"]], a.tail(JOGOS_ALFA)[["FTHG", "FTAG"]]])
-    n = len(jogos)
-    piso = 0.5 / n  # evita alfa = 0 quando o resultado nunca ocorreu na amostra
-    return {s: max(((jogos.FTHG == s[0]) & (jogos.FTAG == s[1])).sum() / n, piso) for s in BAIXOS}
+def freq_historica(hist):
+    """Frequência de 0-0, 1-0, 0-1 e 1-1 em todos os jogos da liga (época atual + anterior)."""
+    n = len(hist)
+    return {s: ((hist.FTHG == s[0]) & (hist.FTAG == s[1])).sum() / n for s in BAIXOS}
 
 
 def matriz(lam_c, lam_f, freq_baixos, normalizar=True):
@@ -133,7 +132,9 @@ def metricas(M):
     return btts, raros
 
 
-def analisar(hist, casa, fora, hoje, normalizar=True):
+def analisar(hist, casa, fora, hoje, normalizar=None):
+    if normalizar is None:
+        normalizar = NORMALIZAR
     h = hist[(hist.HomeTeam == casa) & (hist.Date < hoje)]
     a = hist[(hist.AwayTeam == fora) & (hist.Date < hoje)]
     if len(h) < MIN_JOGOS or len(a) < MIN_JOGOS:
@@ -144,7 +145,7 @@ def analisar(hist, casa, fora, hoje, normalizar=True):
         h10.FTHG.mean(), h10.FTAG.mean(),
         a10.FTAG.mean(), a10.FTHG.mean(),
     )
-    freq = freq_historica(h, a)
+    freq = freq_historica(hist)
     M, beta = matriz(lam_c, lam_f, freq, normalizar)
     btts, raros = metricas(M)
     return {"lam_c": lam_c, "lam_f": lam_f, "beta": beta, "freq": freq,
