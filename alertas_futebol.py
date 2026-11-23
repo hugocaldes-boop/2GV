@@ -48,12 +48,12 @@ LIGAS = {
 LIGAS_EXTRA = {}
 
 JOGOS_AMOSTRA = 10      # últimos N jogos de cada equipa (casa / fora) para os golos esperados
-MIN_JOGOS = 5           # mínimo de jogos de cada equipa para analisar
+MIN_JOGOS = 10           # mínimo de jogos de cada equipa para analisar
 FATOR_CASA = 0.05       # vantagem de casa (5%)
 MAX_GOLOS = 10
 
 LIM_BTTS = 0.65         # BTTS >= 65%
-LIM_RAROS = 0.12        # eventos raros ("2GV") >= 12%
+LIM_RAROS = 0.14        # eventos raros ("2GV") >= 14%
 EXIGIR_AMBOS = True     # True = BTTS E raros; False = qualquer um dos dois
 NORMALIZAR = False      # False = números iguais aos da folha (β=1, matriz soma >100%); True = β automático (soma 100%)
 
@@ -62,7 +62,7 @@ NORMALIZAR = False      # False = números iguais aos da folha (β=1, matriz som
 RAROS = [(2, 2), (3, 2), (2, 3), (3, 3), (4, 3), (3, 4), (4, 4), (4, 2), (2, 4)]
 BAIXOS = [(0, 0), (1, 0), (0, 1), (1, 1)]
 
-DIAS_A_FRENTE = 0       # 0 = só jogos de hoje; 1 = hoje e amanhã
+DIAS_A_FRENTE = 1       # 0 = só jogos de hoje; 1 = hoje e amanhã
 ENVIAR_SE_VAZIO = True  # envia mensagem mesmo sem jogos que cumpram os critérios
 URL_FIXTURES = "https://www.football-data.co.uk/fixtures.csv"
 URL_LIGA = "https://www.football-data.co.uk/mmz4281/{epoca}/{liga}.csv"
