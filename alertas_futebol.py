@@ -17,11 +17,18 @@ Uso:
   python alertas_futebol.py --simular SP1 Barcelona Villarreal   # um jogo à escolha (para validar com a folha)
   python alertas_futebol.py --simular MLS "Inter Miami" "Columbus Crew"   # MLS e BRA (Brasileirão); nomes com espaços entre aspas
 
+  python alertas_futebol.py --simular-euro "FC Barcelona" "Paris Saint-Germain FC"   # jogo europeu (nomes como na API)
+
 Variáveis de ambiente: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+Opcional (competições europeias): FOOTBALL_DATA_API_KEY (chave gratuita de football-data.org)
 """
 import argparse
+import difflib
 import io
 import os
+import time
+import re
+import unicodedata
 from datetime import date
 from math import exp, factorial
 
@@ -41,19 +48,22 @@ LIGAS = {
     "T1": "Süper Lig", "G1": "Super League Grécia",
 }
 
-# Ligas "extra" do football-data.co.uk (ficheiro único com todas as épocas; época = ano civil)
-# (desligadas: dicionário vazio. Para ativar, usa as entradas "MLS" e "BRA" do exemplo abaixo)
-# {"MLS": {"nome": "MLS", "ficheiro": "USA", "pais": "USA", "liga": "MLS"},
-#  "BRA": {"nome": "Brasileirão Série A", "ficheiro": "BRA", "pais": "Brazil", "liga": "Serie A"}}
+# Ligas "extra" (MLS, Brasileirão): DESLIGADAS. Para ativar, troca por:
+#   {"MLS": {"nome": "MLS", "ficheiro": "USA", "pais": "USA", "liga": "MLS"},
+#    "BRA": {"nome": "Brasileirão Série A", "ficheiro": "BRA", "pais": "Brazil", "liga": "Serie A"}}
 LIGAS_EXTRA = {}
 
+# Competições europeias (experimental, precisa de FOOTBALL_DATA_API_KEY): DESLIGADAS.
+# Para ativar, troca por {"CL": "Liga dos Campeões", "EL": "Liga Europa"}
+COMPETICOES_EUROPEIAS = {}
+
 JOGOS_AMOSTRA = 10      # últimos N jogos de cada equipa (casa / fora) para os golos esperados
-MIN_JOGOS = 10           # mínimo de jogos de cada equipa para analisar
+MIN_JOGOS = 10          # mínimo de jogos de cada equipa para analisar
 FATOR_CASA = 0.05       # vantagem de casa (5%)
 MAX_GOLOS = 10
 
 LIM_BTTS = 0.65         # BTTS >= 65%
-LIM_RAROS = 0.14        # eventos raros ("2GV") >= 14%
+LIM_RAROS = 0.13        # eventos raros ("2GV") >= 13%
 EXIGIR_AMBOS = True     # True = BTTS E raros; False = qualquer um dos dois
 NORMALIZAR = False      # False = números iguais aos da folha (β=1, matriz soma >100%); True = β automático (soma 100%)
 
@@ -62,12 +72,13 @@ NORMALIZAR = False      # False = números iguais aos da folha (β=1, matriz som
 RAROS = [(2, 2), (3, 2), (2, 3), (3, 3), (4, 3), (3, 4), (4, 4), (4, 2), (2, 4)]
 BAIXOS = [(0, 0), (1, 0), (0, 1), (1, 1)]
 
-DIAS_A_FRENTE = 0       # 0 = só jogos de hoje; 1 = hoje e amanhã
+DIAS_A_FRENTE = 1       # 0 = só jogos de hoje; 1 = hoje e amanhã
 ENVIAR_SE_VAZIO = True  # envia mensagem mesmo sem jogos que cumpram os critérios
 URL_FIXTURES = "https://www.football-data.co.uk/fixtures.csv"
 URL_LIGA = "https://www.football-data.co.uk/mmz4281/{epoca}/{liga}.csv"
 URL_FIXTURES_EXTRA = "https://www.football-data.co.uk/new_league_fixtures.csv"
 URL_LIGA_EXTRA = "https://www.football-data.co.uk/new/{ficheiro}.csv"
+URL_API = "https://api.football-data.org/v4/competitions/{cod}/matches"
 # =====================================================================
 
 
@@ -76,12 +87,22 @@ def codigo_epoca(d, recuo=0):
     return f"{ano % 100:02d}{(ano + 1) % 100:02d}"
 
 
-def ler_csv(url):
-    r = requests.get(url, timeout=30)
-    if r.status_code != 200:
-        return None
-    texto = r.content.decode("utf-8-sig", errors="replace")
-    return pd.read_csv(io.StringIO(texto), on_bad_lines="skip")
+def ler_csv(url, tentativas=4, timeout=45):
+    """Descarrega um CSV com novas tentativas (o football-data.co.uk às vezes demora ou falha)."""
+    for i in range(1, tentativas + 1):
+        try:
+            r = requests.get(url, timeout=timeout)
+            if r.status_code == 200:
+                texto = r.content.decode("utf-8-sig", errors="replace")
+                return pd.read_csv(io.StringIO(texto), on_bad_lines="skip")
+            if r.status_code == 404:        # o ficheiro não existe (por exemplo, época sem dados)
+                return None
+            print(f"AVISO: HTTP {r.status_code} em {url} (tentativa {i}/{tentativas})")
+        except requests.RequestException as e:
+            print(f"AVISO: {type(e).__name__} em {url} (tentativa {i}/{tentativas})")
+        if i < tentativas:
+            time.sleep(5 * i)
+    return None
 
 
 def _limpar(df):
@@ -117,14 +138,25 @@ def carregar_historico_extra(cfg, hoje):
     return _limpar(df)
 
 
+_CACHE = {}
+
+
 def carregar(liga, hoje):
-    if liga in LIGAS_EXTRA:
-        return carregar_historico_extra(LIGAS_EXTRA[liga], hoje)
-    return carregar_historico(liga, hoje)
+    chave = (liga, hoje)
+    if chave not in _CACHE:
+        if liga in LIGAS_EXTRA:
+            _CACHE[chave] = carregar_historico_extra(LIGAS_EXTRA[liga], hoje)
+        else:
+            _CACHE[chave] = carregar_historico(liga, hoje)
+    return _CACHE[chave]
 
 
 def nome_liga(liga):
-    return LIGAS_EXTRA[liga]["nome"] if liga in LIGAS_EXTRA else LIGAS[liga]
+    if liga in LIGAS_EXTRA:
+        return LIGAS_EXTRA[liga]["nome"]
+    if liga in COMPETICOES_EUROPEIAS:
+        return COMPETICOES_EUROPEIAS[liga] + " (experimental)"
+    return LIGAS[liga]
 
 
 def pmf(lam, n=MAX_GOLOS):
@@ -190,6 +222,132 @@ def analisar(hist, casa, fora, hoje, normalizar=None):
             "h10": h10, "a10": a10}
 
 
+# ------------------- competições europeias (experimental) -------------------
+RUIDO = {"fc", "cf", "afc", "sc", "ac", "as", "ss", "ssc", "rc", "cd", "ud", "sv", "fk", "sk",
+         "bsc", "vfb", "vfl", "tsg", "club", "clube", "de", "calcio", "fotbal"}
+ALIAS = {  # nome da API (normalizado) -> nome no football-data.co.uk
+    "manchester city": "Man City", "manchester united": "Man United",
+    "paris saint germain": "Paris SG", "atletico madrid": "Ath Madrid",
+    "athletic": "Ath Bilbao", "athletic bilbao": "Ath Bilbao",
+    "internazionale milano": "Inter", "internazionale": "Inter", "inter milan": "Inter",
+    "bayern munchen": "Bayern Munich", "borussia monchengladbach": "M'gladbach",
+    "eintracht frankfurt": "Ein Frankfurt", "sporting portugal": "Sp Lisbon", "sporting cp": "Sp Lisbon",
+    "psv": "PSV Eindhoven", "wolverhampton wanderers": "Wolves", "nottingham forest": "Nott'm Forest",
+    "olympique lyonnais": "Lyon", "stade brestois": "Brest",
+    "royale union saint gilloise": "St. Gilloise", "union saint gilloise": "St. Gilloise",
+}
+
+
+def normalizar_nome(n):
+    n = unicodedata.normalize("NFKD", n).encode("ascii", "ignore").decode().lower()
+    palavras = [p for p in re.sub(r"[^a-z0-9 ]", " ", n).split() if p not in RUIDO and not p.isdigit()]
+    return " ".join(palavras)
+
+
+def construir_indice(hoje):
+    """Equipas de todas as ligas nacionais: nome -> (nome normalizado, liga, data do último jogo)."""
+    indice = {}
+    for cod in LIGAS:
+        hist = carregar(cod, hoje)
+        if hist is None:
+            continue
+        for nome in set(hist.HomeTeam) | set(hist.AwayTeam):
+            ultima = hist[(hist.HomeTeam == nome) | (hist.AwayTeam == nome)].Date.max()
+            if nome not in indice or ultima > indice[nome][2]:   # equipa promovida/despromovida: fica a liga atual
+                indice[nome] = (normalizar_nome(nome), cod, ultima)
+    return indice
+
+
+def encontrar_equipa(nome_api, indice):
+    n = normalizar_nome(nome_api)
+    alvo = ALIAS.get(n)
+    if alvo and alvo in indice:
+        return indice[alvo][1], alvo
+    for nome, (nn, cod, _) in indice.items():
+        if nn == n:
+            return cod, nome
+    cand = []
+    for nome, (nn, cod, _) in indice.items():
+        if min(len(nn), len(n)) >= 4 and (f" {nn} " in f" {n} " or f" {n} " in f" {nn} "):
+            cand.append((len(nn), nome, cod))
+    if cand:
+        _, nome, cod = max(cand)
+        return cod, nome
+    melhor = difflib.get_close_matches(n, [v[0] for v in indice.values()], n=1, cutoff=0.85)
+    if melhor:
+        for nome, (nn, cod, _) in indice.items():
+            if nn == melhor[0]:
+                return cod, nome
+    return None
+
+
+def analisar_europeu(hoje, casa, fora, indice, normalizar=None):
+    """Jogo entre equipas de ligas diferentes: força de cada equipa relativa à média da sua liga,
+    aplicada à média de referência dos dois campeonatos."""
+    if normalizar is None:
+        normalizar = NORMALIZAR
+    ec, ef = encontrar_equipa(casa, indice), encontrar_equipa(fora, indice)
+    if ec is None or ef is None:
+        faltam = [n for n, e in ((casa, ec), (fora, ef)) if e is None]
+        print("AVISO: sem dados para: " + ", ".join(faltam))
+        return None
+    (lig_c, nome_c), (lig_f, nome_f) = ec, ef
+    hc, hf = carregar(lig_c, hoje), carregar(lig_f, hoje)
+    h = hc[(hc.HomeTeam == nome_c) & (hc.Date < hoje)]
+    a = hf[(hf.AwayTeam == nome_f) & (hf.Date < hoje)]
+    if len(h) < MIN_JOGOS or len(a) < MIN_JOGOS:
+        print(f"AVISO: poucos jogos para {casa} ({len(h)}) ou {fora} ({len(a)})")
+        return None
+    h10, a10 = h.tail(JOGOS_AMOSTRA), a.tail(JOGOS_AMOSTRA)
+    lh_c, la_c = hc.FTHG.mean(), hc.FTAG.mean()      # médias da liga da casa (golos casa / golos fora)
+    lh_f, la_f = hf.FTHG.mean(), hf.FTAG.mean()      # médias da liga do visitante
+    ref_h, ref_a = (lh_c + lh_f) / 2, (la_c + la_f) / 2
+    base_c = (h10.FTHG.mean() / lh_c) * (a10.FTHG.mean() / lh_f) * ref_h
+    base_f = (a10.FTAG.mean() / la_f) * (h10.FTAG.mean() / la_c) * ref_a
+    lam_c = base_c * (1 + FATOR_CASA)
+    lam_f = max(base_c + base_f - lam_c, 0.05)
+    fc, ff = freq_historica(hc), freq_historica(hf)
+    freq = {s: (fc[s] + ff[s]) / 2 for s in BAIXOS}
+    M, beta = matriz(lam_c, lam_f, freq, normalizar)
+    btts, raros = metricas(M)
+    return {"lam_c": lam_c, "lam_f": lam_f, "beta": beta, "freq": freq, "btts": btts, "raros": raros,
+            "soma": M.sum(), "equipas_csv": (nome_c, lig_c, nome_f, lig_f)}
+
+
+def fixtures_europeus(chave, hoje):
+    jogos = []
+    ate = hoje + pd.Timedelta(days=DIAS_A_FRENTE)
+    for cod, nome in COMPETICOES_EUROPEIAS.items():
+        try:
+            r = requests.get(URL_API.format(cod=cod), headers={"X-Auth-Token": chave},
+                             params={"dateFrom": f"{hoje:%Y-%m-%d}", "dateTo": f"{ate:%Y-%m-%d}"}, timeout=30)
+        except requests.RequestException as e:
+            print(f"AVISO: {nome} indisponível ({e})")
+            continue
+        if r.status_code != 200:
+            print(f"AVISO: {nome} ({cod}) indisponível: HTTP {r.status_code}")
+            continue
+        for mj in r.json().get("matches", []):
+            if mj.get("status") not in ("SCHEDULED", "TIMED"):
+                continue
+            c, f = (mj.get("homeTeam") or {}).get("name"), (mj.get("awayTeam") or {}).get("name")
+            if c and f:
+                jogos.append((cod, {"HomeTeam": c, "AwayTeam": f, "Time": mj.get("utcDate", "")[11:16] + " UTC"}))
+    return jogos
+
+
+DIAS_SEMANA = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
+
+
+def nome_dia(d, hoje, curto=False):
+    """HOJE / AMANHÃ + dia da semana e data. curto=True: 'HOJE 27/11'."""
+    rel = {0: "HOJE", 1: "AMANHÃ"}.get((d.normalize() - hoje).days)
+    if curto:
+        return f"{rel} {d:%d/%m}" if rel else f"{d:%d/%m}"
+    base = f"{DIAS_SEMANA[d.weekday()]} {d:%d/%m}"
+    return f"{rel} ({base})" if rel else base
+
+
 def cumpre(r):
     ok_b, ok_r = r["btts"] >= LIM_BTTS, r["raros"] >= LIM_RAROS
     return (ok_b and ok_r) if EXIGIR_AMBOS else (ok_b or ok_r)
@@ -241,9 +399,24 @@ def simular(liga, casa, fora, hoje):
         print(f"BTTS={r['btts']:.1%}  Raros={r['raros']:.2%}")
 
 
+def simular_euro(casa, fora, hoje):
+    indice = construir_indice(hoje)
+    for norm in (False, True):
+        r = analisar_europeu(hoje, casa, fora, indice, normalizar=norm)
+        if r is None:
+            return
+        nc, lc, nf, lf = r["equipas_csv"]
+        if not norm:
+            print(f"\n{casa} -> {nc} ({lc}) | {fora} -> {nf} ({lf})")
+        print(f"\n--- {'NORMALIZADO (β automático)' if norm else 'SEM normalizar (β=1, como na folha)'} ---")
+        print(f"Golos esperados: {r['lam_c']:.2f} - {r['lam_f']:.2f} | β={r['beta']:.3f} | soma={r['soma']:.2%}")
+        print(f"BTTS={r['btts']:.1%}  Raros={r['raros']:.2%}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--simular", nargs=3, metavar=("LIGA", "CASA", "FORA"))
+    ap.add_argument("--simular-euro", nargs=2, metavar=("CASA", "FORA"))
     ap.add_argument("--sem-telegram", action="store_true")
     args = ap.parse_args()
     hoje = pd.Timestamp(date.today())
@@ -251,11 +424,17 @@ def main():
     if args.simular:
         simular(*args.simular, hoje)
         return
+    if args.simular_euro:
+        simular_euro(*args.simular_euro, hoje)
+        return
 
     fx = ler_csv(URL_FIXTURES)
     if fx is None:
         raise SystemExit("ERRO: não consegui descarregar o fixtures.csv")
     fx["Date"] = pd.to_datetime(fx["Date"], dayfirst=True, errors="coerce")
+    datas_fx = fx[fx.Div.isin(LIGAS)].Date.dropna()      # datas que o ficheiro de jogos contém
+    if len(datas_fx):
+        print(f"fixtures.csv: jogos de {datas_fx.min():%d/%m/%Y} a {datas_fx.max():%d/%m/%Y}")
     fx = fx[(fx.Date >= hoje) & (fx.Date <= hoje + pd.Timedelta(days=DIAS_A_FRENTE))]
     fx = fx[fx.Div.isin(LIGAS)]
 
@@ -274,31 +453,63 @@ def main():
             if len(sub):
                 jogos_por_liga[cod] = sub
 
-    alertas, analisados = [], 0
+    alertas, analisados, por_dia = [], 0, {}
     for liga, jogos in jogos_por_liga.items():
         hist = carregar(liga, hoje)
         if hist is None:
+            print(f"AVISO: sem histórico para {liga}; jogos ignorados.")
             continue
         for _, j in jogos.iterrows():
             r = analisar(hist, j.HomeTeam, j.AwayTeam, hoje)
             if r is None:
                 continue
             analisados += 1
+            d = j.get("Date")
+            if pd.notna(d):
+                por_dia[d.normalize()] = por_dia.get(d.normalize(), 0) + 1
             if cumpre(r):
                 alertas.append((liga, j, r))
 
+    # competições europeias (precisa da chave da API; se não existir, é ignorada)
+    chave = os.environ.get("FOOTBALL_DATA_API_KEY")
+    if chave:
+        europeus = fixtures_europeus(chave, hoje)
+        if europeus:
+            indice = construir_indice(hoje)
+            for cod, j in europeus:
+                r = analisar_europeu(hoje, j["HomeTeam"], j["AwayTeam"], indice)
+                if r is None:
+                    continue
+                analisados += 1
+                if cumpre(r):
+                    alertas.append((cod, pd.Series(j), r))
+
     cab = f"⚽ Alertas {hoje:%d/%m/%Y} — {analisados} jogos analisados"
-    if not alertas:
-        texto = cab + "\nNenhum jogo cumpre os critérios hoje."
+    if por_dia:
+        cab += " (" + ", ".join(f"{ {0: 'hoje', 1: 'amanhã'}.get((d - hoje).days, f'{d:%d/%m}') } {n}" for d, n in sorted(por_dia.items())) + ")"
+    if analisados == 0:
+        texto = cab + "\nNenhum jogo analisado: o ficheiro de jogos ainda não tem jogos para estes dias (ou as equipas não têm 10 jogos de histórico)."
+    elif not alertas:
+        texto = cab + "\nNenhum jogo cumpre os critérios."
     else:
-        linhas = [cab, f"Critérios: BTTS ≥ {LIM_BTTS:.0%} {'e' if EXIGIR_AMBOS else 'ou'} raros ≥ {LIM_RAROS:.0%}\n"]
-        for liga, j, r in sorted(alertas, key=lambda x: -x[2]["raros"]):
-            hora = j.get("Time", "")
-            linhas.append(f"{nome_liga(liga)} {hora}\n{j.HomeTeam} vs {j.AwayTeam}\n"
-                          f"BTTS {r['btts']:.1%} (odd {odd(r['btts']):.2f}) | "
-                          f"Raros {r['raros']:.1%} (odd {odd(r['raros']):.2f})\n"
-                          f"Golos esperados {r['lam_c']:.2f} - {r['lam_f']:.2f}\n")
+        linhas = [cab, f"Critérios: BTTS ≥ {LIM_BTTS:.0%} {'e' if EXIGIR_AMBOS else 'ou'} raros ≥ {LIM_RAROS:.0%}"]
+        dias = sorted({j.get("Date") for _, j, _ in alertas if pd.notna(j.get("Date"))})
+        grupos = [(d, [a for a in alertas if a[1].get("Date") == d]) for d in dias]
+        grupos += [(None, [a for a in alertas if pd.isna(a[1].get("Date"))])]
+        for d, lista in grupos:
+            if not lista:
+                continue
+            linhas.append(f"\n📅 {nome_dia(d, hoje) if d is not None else 'Data desconhecida'} — {len(lista)} alerta(s)")
+            for liga, j, r in sorted(lista, key=lambda x: -x[2]["raros"]):
+                etiqueta = f"{nome_dia(d, hoje, curto=True)} " if d is not None else ""
+                linhas.append(f"\n{nome_liga(liga)} — {etiqueta}{j.get('Time', '')}\n{j.HomeTeam} vs {j.AwayTeam}\n"
+                              f"BTTS {r['btts']:.1%} (odd {odd(r['btts']):.2f}) | "
+                              f"Raros {r['raros']:.1%} (odd {odd(r['raros']):.2f})\n"
+                              f"Golos esperados {r['lam_c']:.2f} - {r['lam_f']:.2f}")
         texto = "\n".join(linhas)
+
+    if len(datas_fx):
+        texto += f"\n\nℹ️ O ficheiro de jogos tem datas de {datas_fx.min():%d/%m} a {datas_fx.max():%d/%m}."
 
     print(texto)
     if not args.sem_telegram and (alertas or ENVIAR_SE_VAZIO):
