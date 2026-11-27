@@ -60,6 +60,14 @@ COMPETICOES_EUROPEIAS = {}
 JOGOS_AMOSTRA = 10      # últimos N jogos de cada equipa (casa / fora) para os golos esperados
 MIN_JOGOS = 10          # mínimo de jogos de cada equipa para analisar
 FATOR_CASA = 0.05       # vantagem de casa (5%)
+
+# Equipas promovidas/despromovidas: se tiverem menos de MIN_JOGOS jogos na liga, completam-se os jogos
+# em falta (até JOGOS_AMOSTRA) com os da divisão vizinha, ajustados pela diferença de golos entre as duas ligas.
+# Equipas com histórico completo NÃO são afetadas. Põe False para desligar.
+COMPLETAR_COM_DIVISAO_VIZINHA = True
+MIN_JOGOS_LIGA = 4      # mínimo de jogos na liga atual (nesse campo) para poder completar
+VIZINHAS = {"E0": ["E1"], "E1": ["E0", "E2"], "SP1": ["SP2"], "SP2": ["SP1"], "D1": ["D2"], "D2": ["D1"],
+            "I1": ["I2"], "I2": ["I1"], "F1": ["F2"], "F2": ["F1"]}
 MAX_GOLOS = 10
 
 LIM_BTTS = 0.65         # BTTS >= 65%
@@ -199,11 +207,48 @@ def metricas(M):
     return btts, raros
 
 
-def analisar(hist, casa, fora, hoje, normalizar=None):
+def completar(hist, liga, equipa, em_casa, hoje, atuais):
+    """Completa os jogos de uma equipa promovida/despromovida com os da divisão vizinha.
+    Os golos são reescalados pela razão entre as médias das duas ligas (marcados e sofridos)."""
+    faltam = JOGOS_AMOSTRA - len(atuais)
+    if faltam <= 0 or len(atuais) < MIN_JOGOS_LIGA:
+        return atuais, None
+    for viz in VIZINHAS.get(liga, []):
+        hv = carregar(viz, hoje)
+        if hv is None:
+            continue
+        nomes = set(hv.HomeTeam) | set(hv.AwayTeam)
+        nome_v = equipa if equipa in nomes else None
+        if nome_v is None:
+            mini = {n: (normalizar_nome(n), viz, hv.Date.max()) for n in nomes}
+            achado = encontrar_equipa(equipa, mini)
+            nome_v = achado[1] if achado else None
+        if nome_v is None:
+            continue
+        col = "HomeTeam" if em_casa else "AwayTeam"
+        extra = hv[(hv[col] == nome_v) & (hv.Date < hoje)].tail(faltam).copy()
+        if extra.empty:
+            continue
+        extra["FTHG"] = extra.FTHG * (hist.FTHG.mean() / hv.FTHG.mean())
+        extra["FTAG"] = extra.FTAG * (hist.FTAG.mean() / hv.FTAG.mean())
+        nome = nome_liga(viz) if viz in LIGAS else viz
+        return pd.concat([extra, atuais]), f"{equipa}: {len(atuais)} jogos na liga + {len(extra)} da {nome}"
+    return atuais, None
+
+
+def analisar(hist, casa, fora, hoje, normalizar=None, liga=None):
     if normalizar is None:
         normalizar = NORMALIZAR
     h = hist[(hist.HomeTeam == casa) & (hist.Date < hoje)]
     a = hist[(hist.AwayTeam == fora) & (hist.Date < hoje)]
+    notas = []
+    if COMPLETAR_COM_DIVISAO_VIZINHA and liga and (len(h) < MIN_JOGOS or len(a) < MIN_JOGOS):
+        if len(h) < MIN_JOGOS:
+            h, nota = completar(hist, liga, casa, True, hoje, h)
+            notas += [nota] if nota else []
+        if len(a) < MIN_JOGOS:
+            a, nota = completar(hist, liga, fora, False, hoje, a)
+            notas += [nota] if nota else []
     if len(h) < MIN_JOGOS or len(a) < MIN_JOGOS:
         return None
     h10, a10 = h.tail(JOGOS_AMOSTRA), a.tail(JOGOS_AMOSTRA)
@@ -219,7 +264,7 @@ def analisar(hist, casa, fora, hoje, normalizar=None):
             "btts": btts, "raros": raros, "soma": M.sum(),
             "liga": (hist.FTHG.mean(), hist.FTAG.mean(), len(hist), hist.Date.min(), hist.Date.max()),
             "equipas": (h10.FTHG.mean(), h10.FTAG.mean(), a10.FTAG.mean(), a10.FTHG.mean()),
-            "h10": h10, "a10": a10}
+            "h10": h10, "a10": a10, "notas": notas}
 
 
 # ------------------- competições europeias (experimental) -------------------
@@ -336,6 +381,18 @@ def fixtures_europeus(chave, hoje):
     return jogos
 
 
+def motivo_ignorado(hist, casa, fora, hoje):
+    """Explica porque um jogo não foi analisado (histórico insuficiente ou nome diferente)."""
+    h = hist[(hist.HomeTeam == casa) & (hist.Date < hoje)]
+    a = hist[(hist.AwayTeam == fora) & (hist.Date < hoje)]
+    partes = []
+    if len(h) < MIN_JOGOS:
+        partes.append(f"{casa}: {len(h)} jogos em casa" if len(h) else f"{casa}: sem jogos no histórico (nome diferente?)")
+    if len(a) < MIN_JOGOS:
+        partes.append(f"{fora}: {len(a)} jogos fora" if len(a) else f"{fora}: sem jogos no histórico (nome diferente?)")
+    return "; ".join(partes) or "sem dados suficientes"
+
+
 DIAS_SEMANA = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
 
 
@@ -381,11 +438,13 @@ def simular(liga, casa, fora, hoje):
         print("Não consegui descarregar os dados da liga.")
         return
     for norm in (False, True):
-        r = analisar(hist, casa, fora, hoje, normalizar=norm)
+        r = analisar(hist, casa, fora, hoje, normalizar=norm, liga=liga)
         if r is None:
-            print("Poucos jogos de uma das equipas.")
+            print(f"Jogo ignorado: {motivo_ignorado(hist, casa, fora, hoje)} (mínimo {MIN_JOGOS} jogos).")
             return
         if not norm:
+            for nota in r["notas"]:
+                print(f"HISTÓRICO COMPLETADO -> {nota} (golos reescalados)")
             lc, lf, n, d0, d1 = r["liga"]
             cm, cs, fm, fs = r["equipas"]
             print(f"\nLiga: {n} jogos ({d0:%d/%m/%Y} a {d1:%d/%m/%Y}) | média golos casa {lc:.2f}, fora {lf:.2f}")
@@ -453,15 +512,16 @@ def main():
             if len(sub):
                 jogos_por_liga[cod] = sub
 
-    alertas, analisados, por_dia = [], 0, {}
+    alertas, analisados, por_dia, ignorados = [], 0, {}, []
     for liga, jogos in jogos_por_liga.items():
         hist = carregar(liga, hoje)
         if hist is None:
             print(f"AVISO: sem histórico para {liga}; jogos ignorados.")
             continue
         for _, j in jogos.iterrows():
-            r = analisar(hist, j.HomeTeam, j.AwayTeam, hoje)
+            r = analisar(hist, j.HomeTeam, j.AwayTeam, hoje, liga=liga)
             if r is None:
+                ignorados.append((j, motivo_ignorado(hist, j.HomeTeam, j.AwayTeam, hoje)))
                 continue
             analisados += 1
             d = j.get("Date")
@@ -505,8 +565,17 @@ def main():
                 linhas.append(f"\n{nome_liga(liga)} — {etiqueta}{j.get('Time', '')}\n{j.HomeTeam} vs {j.AwayTeam}\n"
                               f"BTTS {r['btts']:.1%} (odd {odd(r['btts']):.2f}) | "
                               f"Raros {r['raros']:.1%} (odd {odd(r['raros']):.2f})\n"
-                              f"Golos esperados {r['lam_c']:.2f} - {r['lam_f']:.2f}")
+                              f"Golos esperados {r['lam_c']:.2f} - {r['lam_f']:.2f}"
+                              + (f"\n⚠️ Histórico completado: {'; '.join(r['notas'])}" if r.get("notas") else ""))
         texto = "\n".join(linhas)
+
+    if ignorados:
+        for j, motivo in ignorados:
+            print(f"IGNORADO: {j.HomeTeam} vs {j.AwayTeam} ({motivo})")
+        extra = [f"• {j.HomeTeam} vs {j.AwayTeam} ({motivo})" for j, motivo in ignorados[:12]]
+        if len(ignorados) > 12:
+            extra.append(f"• ... e mais {len(ignorados) - 12}")
+        texto += f"\n\n⚠️ Não analisados por falta de histórico (mínimo {MIN_JOGOS} jogos):\n" + "\n".join(extra)
 
     if len(datas_fx):
         texto += f"\n\nℹ️ O ficheiro de jogos tem datas de {datas_fx.min():%d/%m} a {datas_fx.max():%d/%m}."
