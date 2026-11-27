@@ -560,7 +560,7 @@ def main():
             if not lista:
                 continue
             linhas.append(f"\n📅 {nome_dia(d, hoje) if d is not None else 'Data desconhecida'} — {len(lista)} alerta(s)")
-            for liga, j, r in sorted(lista, key=lambda x: -x[2]["raros"]):
+            for liga, j, r in sorted(lista, key=lambda x: (str(x[1].get("Time", "")) or "99:99", -x[2]["raros"])):
                 etiqueta = f"{nome_dia(d, hoje, curto=True)} " if d is not None else ""
                 linhas.append(f"\n{nome_liga(liga)} — {etiqueta}{j.get('Time', '')}\n{j.HomeTeam} vs {j.AwayTeam}\n"
                               f"BTTS {r['btts']:.1%} (odd {odd(r['btts']):.2f}) | "
@@ -569,13 +569,8 @@ def main():
                               + (f"\n⚠️ Histórico completado: {'; '.join(r['notas'])}" if r.get("notas") else ""))
         texto = "\n".join(linhas)
 
-    if ignorados:
-        for j, motivo in ignorados:
-            print(f"IGNORADO: {j.HomeTeam} vs {j.AwayTeam} ({motivo})")
-        extra = [f"• {j.HomeTeam} vs {j.AwayTeam} ({motivo})" for j, motivo in ignorados[:12]]
-        if len(ignorados) > 12:
-            extra.append(f"• ... e mais {len(ignorados) - 12}")
-        texto += f"\n\n⚠️ Não analisados por falta de histórico (mínimo {MIN_JOGOS} jogos):\n" + "\n".join(extra)
+    for j, motivo in ignorados:      # só no registo do workflow; não vai para o alerta
+        print(f"IGNORADO: {j.HomeTeam} vs {j.AwayTeam} ({motivo})")
 
     if len(datas_fx):
         texto += f"\n\nℹ️ O ficheiro de jogos tem datas de {datas_fx.min():%d/%m} a {datas_fx.max():%d/%m}."
