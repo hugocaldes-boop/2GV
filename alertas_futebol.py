@@ -62,7 +62,7 @@ NORMALIZAR = False      # False = números iguais aos da folha (β=1, matriz som
 RAROS = [(2, 2), (3, 2), (2, 3), (3, 3), (4, 3), (3, 4), (4, 4), (4, 2), (2, 4)]
 BAIXOS = [(0, 0), (1, 0), (0, 1), (1, 1)]
 
-DIAS_A_FRENTE = 1       # 0 = só jogos de hoje; 1 = hoje e amanhã
+DIAS_A_FRENTE = 0       # 0 = só jogos de hoje; 1 = hoje e amanhã
 ENVIAR_SE_VAZIO = True  # envia mensagem mesmo sem jogos que cumpram os critérios
 URL_FIXTURES = "https://www.football-data.co.uk/fixtures.csv"
 URL_LIGA = "https://www.football-data.co.uk/mmz4281/{epoca}/{liga}.csv"
